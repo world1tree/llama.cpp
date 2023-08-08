@@ -255,6 +255,7 @@ class SentencePieceVocab:
         else:
           vocab_size: int = self.sentencepiece_tokenizer.vocab_size()
         expected_ids = list(range(vocab_size, vocab_size + len(added_tokens)))
+        # id只能追加到已知词表的最后方
         actual_ids = sorted(added_tokens.values())
         if expected_ids != actual_ids:
             raise Exception(f"Expected added token IDs to be sequential and start at {len(added_tokens)}; got {actual_ids}")
@@ -281,6 +282,7 @@ class SentencePieceVocab:
               text: bytes
               if tokenizer.is_unknown(i):
                   text = " \u2047 ".encode("utf-8")
+              # 忽略控制字符
               elif tokenizer.is_control(i):
                   text = b""
               elif tokenizer.is_byte(i):
@@ -296,6 +298,7 @@ class SentencePieceVocab:
 
     def added_tokens(self) -> Iterable[Tuple[bytes, float]]:
         for text in self.added_tokens_list:
+            # 新加的词权重统一为-1000
             score = -1000.0
             yield text.encode("utf-8"), score
 
@@ -406,6 +409,7 @@ class UnquantizedTensor(Tensor):
         return self
 
     def permute_part(self, n_part: int, n_head: int) -> 'UnquantizedTensor':
+        # 为什么要整除3
         r = self.ndarray.shape[0] // 3
         return UnquantizedTensor(permute(self.ndarray[r * n_part : r * n_part + r, ...], n_head))
 
@@ -701,6 +705,7 @@ def merge_multifile_models(models_plus: List[ModelPlus]) -> ModelPlus:
         for mp in models_plus:
             model.update(mp.model)
     else:
+        # 走该分支
         model = merge_sharded([mp.model for mp in models_plus])
 
     return ModelPlus(model, paths, format, vocab)
@@ -813,6 +818,7 @@ class LazyUnpickler(pickle.Unpickler):
         self.zip_file = zip_file
 
     def persistent_load(self, pid: Any) -> Any:
+        # 这个肯定是处理特殊对象的方案, 特殊对象是根据pid定位的, 这个文件应该没有用到
         assert pid[0] == 'storage'
         assert isinstance(pid[1], LazyStorageKind)
         data_type = pid[1].data_type
@@ -837,6 +843,7 @@ class LazyUnpickler(pickle.Unpickler):
     def lazy_rebuild_tensor_v2(storage: Any, storage_offset: Any, size: Any, stride: Any,
                                # pyright: ignore[reportSelfClsParameterName]
                                requires_grad: Any, backward_hooks: Any, metadata: Any = None) -> LazyTensor:
+        # llama的模型全部走了该函数
         assert isinstance(storage, LazyStorage)
 
         def load() -> UnquantizedTensor:
@@ -860,15 +867,19 @@ class LazyUnpickler(pickle.Unpickler):
     }
 
     def find_class(self, module: str, name: str) -> Any:
+        # 会被load方法内部调用
         if not module.startswith('torch'):
             return super().find_class(module, name)
         return self.CLASSES[(module, name)]
 
 
 def lazy_load_torch_file(outer_fp: IO[bytes], path: Path) -> ModelPlus:
+    # ZipFile可以操作文件io，此时outer_fp相当于就是压缩文件
     zf = zipfile.ZipFile(outer_fp)
     pickle_paths = [name for name in zf.namelist() if name.endswith('.pkl')]
+    # 只有一个文件,consolidated/data.pkl
     assert len(pickle_paths) == 1, pickle_paths
+    # 打开压缩文件
     pickle_fp = zf.open(pickle_paths[0], 'r')
     unpickler = LazyUnpickler(pickle_fp,
                               data_base_path=pickle_paths[0][:-4],
@@ -997,9 +1008,11 @@ def lazy_load_ggml_file(fp: io.BufferedReader, path: Path) -> ModelPlus:
 
 @functools.lru_cache(maxsize=None)
 def lazy_load_file(path: Path) -> ModelPlus:
+    # lru_cache, maxsize=None表示缓存大小无限制, 如果第二次lazy_load_file相同的文件，不用重新计算
     fp = open(path, 'rb')
     first8 = fp.read(8)
     fp.seek(0)
+    # llama是PK
     if first8[:2] == b'PK':
         # A zip file, i.e. PyTorch format
         return lazy_load_torch_file(fp, path)
@@ -1057,30 +1070,39 @@ class OutputFile:
         self.fout = open(fname_out, "wb")
 
     def write_file_header(self, params: Params, file_type: GGMLFileType) -> None:
+        # ggit为何需要逆序写入, 小端存储
         self.fout.write(b"ggjt"[::-1])  # magic
         values = [
             1,  # file version
-            params.n_vocab,
-            params.n_embd,
-            params.n_mult,
-            params.n_head,
-            params.n_layer,
+            params.n_vocab, # 词表大小
+            params.n_embd,  # embedding size
+            params.n_mult,  #
+            params.n_head,  # head数
+            params.n_layer, # 层数
             params.n_embd // params.n_head,  # rot (obsolete)
             file_type.value,
         ]
+        # i对应c中的int
         self.fout.write(struct.pack("i" * len(values), *values))
 
     def write_tensor_header(self, name: str, shape: Sequence[int], data_type: DataType) -> None:
         sname = name.encode('utf-8')
+        # shape有几个维度, sname表示tensor的名字长度, data_type标识符(fp32, fp16, q4_0, q4_1)
         self.fout.write(struct.pack("iii", len(shape), len(sname), DATA_TYPE_TO_FTYPE[data_type]))
+        # 每个维度的大小，反着写, 这里不是大小端的原因，而是c那边的存储结构就是反着的
         self.fout.write(struct.pack("i" * len(shape), *shape[::-1]))
+        # tensor的名字
         self.fout.write(sname)
+        # 对齐到下一个32个字节的位置, 这里不确定为什么选32而不是其它, 而且为什么只在这里做对齐 TODO
         self.fout.seek((self.fout.tell() + 31) & -32)
 
     def write_vocab(self, vocab: Vocab) -> None:
         for text, score in vocab.all_tokens():
+            # i对应c中的int, 单词长度
             self.fout.write(struct.pack("i", len(text)))
+            # 单词
             self.fout.write(text)
+            # f对应c中的float, 单词得分
             self.fout.write(struct.pack("f", score))
 
     @staticmethod
@@ -1207,6 +1229,7 @@ def load_some_model(path: Path) -> ModelPlus:
             raise Exception(f"Found multiple models in {path}, not sure which to pick: {files}")
         path = files[0]
 
+    # 对于llama而言，paths只有consolidated.00.pth一个文件
     paths = find_multifile_paths(path)
     models_plus: List[ModelPlus] = []
     for path in paths:

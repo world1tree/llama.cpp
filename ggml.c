@@ -432,6 +432,8 @@ static inline ggml_fp16_t ggml_compute_fp32_to_fp16(float f) {
 // global data
 //
 
+// 16位浮点数的每一个值都会有一个条目
+
 // precomputed gelu table for f16 (128 KB)
 static ggml_fp16_t table_gelu_f16[1 << 16];
 
@@ -894,9 +896,12 @@ inline static int32x4_t vcvtnq_s32_f32(float32x4_t v) {
 
 #define QK4_0 32
 typedef struct {
+    // uint16_t, 2字节
     ggml_fp16_t d;          // delta
+    // 16个字节, 32个元素4bit量化，所占空间位32*0.5bytes)
     uint8_t qs[QK4_0 / 2];  // nibbles / quants
 } block_q4_0;
+// 整个结构体占用18个字节
 static_assert(sizeof(block_q4_0) == sizeof(ggml_fp16_t) + QK4_0 / 2, "wrong q4_0 block size/padding");
 
 #define QK4_1 32
@@ -910,7 +915,7 @@ static_assert(sizeof(block_q4_1) == 2 * sizeof(ggml_fp16_t) + QK4_1 / 2, "wrong 
 #define QK5_0 32
 typedef struct {
     ggml_fp16_t d;         // delta
-    uint8_t qh[4];         // 5-th bit of quants
+    uint8_t qh[4];         // 5-th bit of quants, 32个元素 * (1/8)bytes
     uint8_t qs[QK5_0 / 2]; // nibbles / quants
 } block_q5_0;
 static_assert(sizeof(block_q5_0) == sizeof(ggml_fp16_t) + sizeof(uint32_t) + QK5_0 / 2, "wrong q5_0 block size/padding");
@@ -927,7 +932,7 @@ static_assert(sizeof(block_q5_1) == 2 * sizeof(ggml_fp16_t) + sizeof(uint32_t) +
 #define QK8_0 32
 typedef struct {
     ggml_fp16_t d;         // delta
-    int8_t  qs[QK8_0];     // quants
+    int8_t  qs[QK8_0];     // quants, 用了有符号整数，32个元素，占用32字节
 } block_q8_0;
 static_assert(sizeof(block_q8_0) == sizeof(ggml_fp16_t) + QK8_0, "wrong q8_0 block size/padding");
 
@@ -943,14 +948,18 @@ static_assert(sizeof(block_q8_1) == 2*sizeof(float) + QK8_1, "wrong q8_1 block s
 static void quantize_row_q4_0_reference(const float * restrict x, block_q4_0 * restrict y, int k) {
     static const int qk = QK4_0;
 
+    // k表示总共有多少个元素
+    // qk感觉像是分组, qk数值为32
     assert(k % qk == 0);
 
     const int nb = k / qk;
 
     for (int i = 0; i < nb; i++) {
+        // 所谓数值大是根据绝对值的大小来衡量的
         float amax = 0.0f; // absolute max
         float max  = 0.0f;
 
+        // 针对每一组去量化, 每组只会有一个block结构体, 32个float数值变为16个8bit数值
         for (int j = 0; j < qk; j++) {
             const float v = x[i*qk + j];
             if (amax < fabsf(v)) {
@@ -964,13 +973,17 @@ static void quantize_row_q4_0_reference(const float * restrict x, block_q4_0 * r
 
         y[i].d = GGML_FP32_TO_FP16(d);
 
+        // 循环16次, 每次处理两个数值, 除以delta
         for (int j = 0; j < qk/2; ++j) {
+            // 范围应当是-8到8之间
             const float x0 = x[i*qk + 0    + j]*id;
             const float x1 = x[i*qk + qk/2 + j]*id;
 
+            // 0.5-16.5之间
             const uint8_t xi0 = MIN(15, (int8_t)(x0 + 8.5f));
             const uint8_t xi1 = MIN(15, (int8_t)(x1 + 8.5f));
 
+            // 用1个8bit的数值来存储两个4bit的数值
             y[i].qs[j]  = xi0;
             y[i].qs[j] |= xi1 << 4;
         }
@@ -3901,6 +3914,7 @@ static bool GGML_OP_HAS_INIT    [GGML_OP_COUNT] = { 0 };
 static bool GGML_OP_HAS_FINALIZE[GGML_OP_COUNT] = { 0 };
 
 static void ggml_setup_op_has_task_pass(void) {
+    // 这个函数应该是初始化可用的tensor操作
     {   // INIT
         bool * p = GGML_OP_HAS_INIT;
 
@@ -3929,16 +3943,26 @@ static void ggml_setup_op_has_task_pass(void) {
 //
 
 struct ggml_context {
+    // 内存大小
     size_t mem_size;
+    // 必然是预先分配的
     void * mem_buffer;
     bool   mem_buffer_owned;
     bool   no_alloc;
     bool   no_alloc_save; // this is used to save the no_alloc state when using scratch buffers
 
+    // 对象个数
     int    n_objects;
 
+    // 起始对象metadata(头指针)
     struct ggml_object * objects_begin;
+    // 结束对象metadata(尾指针)
     struct ggml_object * objects_end;
+    /*
+     *    - - - - - - - - - - -- - - - - - - -- - - - -
+     *    |                                            |
+     * --obj1(begin)--tensor1--tensor_data(optional)--obj2--tensor2...
+     */
 
     struct ggml_scratch scratch;
     struct ggml_scratch scratch_save;
@@ -3963,6 +3987,7 @@ struct ggml_numa_node {
 };
 
 struct ggml_numa_nodes {
+    // 8
     struct ggml_numa_node nodes[GGML_NUMA_MAX_NODES];
     uint32_t n_nodes;
     uint32_t total_cpus; // hardware threads on system
@@ -3973,6 +3998,7 @@ struct ggml_numa_nodes {
 //
 
 struct ggml_state {
+    // 64
     struct ggml_context_container contexts[GGML_MAX_CONTEXTS];
     struct ggml_numa_nodes numa;
 };
@@ -4301,6 +4327,7 @@ static inline int ggml_up(int n, int m) {
 ////////////////////////////////////////////////////////////////////////////////
 
 struct ggml_context * ggml_init(struct ggml_init_params params) {
+    // 这个函数可能被多个线程调用，并且这个函数可能被调用多次
     // make this function thread safe
     ggml_critical_section_start();
 
@@ -4317,6 +4344,7 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
             ggml_fp16_t ii;
             for (int i = 0; i < (1 << 16); ++i) {
                 uint16_t ui = i;
+                // 避免类型转换
                 memcpy(&ii, &ui, sizeof(ii));
                 const float f = table_f32_f16[i] = GGML_COMPUTE_FP16_TO_FP32(ii);
                 table_gelu_f16[i] = GGML_FP32_TO_FP16(ggml_gelu_f32(f));
@@ -4334,6 +4362,7 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
         {
             const uint64_t t_start = ggml_time_us(); UNUSED(t_start);
 
+            // metadata是预先就有的, ctx不会超过64
             g_state = (struct ggml_state) {
                 /*.contexts =*/ { { 0 } },
                 /*.numa =*/ {
@@ -4365,6 +4394,7 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
     // find non-used context in g_state
     struct ggml_context * ctx = NULL;
 
+    // 由于只有64个, 线性遍历开销不会很大
     for (int i = 0; i < GGML_MAX_CONTEXTS; i++) {
         if (!g_state.contexts[i].used) {
             g_state.contexts[i].used = true;
@@ -4383,8 +4413,11 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
         return NULL;
     }
 
+    // mem_size按16字节对齐
     const size_t mem_size = params.mem_buffer ? params.mem_size : GGML_PAD(params.mem_size, GGML_MEM_ALIGN);
 
+    // 此处才实际分配内存, 如果有mem_buffer, 那么不需要额外分配内存
+    // mem_buffer_owned表示当前的mem_buffer是不是独占的
     *ctx = (struct ggml_context) {
         /*.mem_size           =*/ mem_size,
         /*.mem_buffer         =*/ params.mem_buffer ? params.mem_buffer : GGML_ALIGNED_MALLOC(mem_size),
@@ -4519,10 +4552,11 @@ static struct ggml_object * ggml_new_object(struct ggml_context * ctx, enum ggml
     const size_t cur_size = obj_cur == NULL ? 0 : obj_cur->size;
     const size_t cur_end  = cur_offs + cur_size;
 
-    // align to GGML_MEM_ALIGN
+    // align to GGML_MEM_ALIGN, 16字节对齐
     size_t size_needed = GGML_PAD(size, GGML_MEM_ALIGN);
 
     char * const mem_buffer = ctx->mem_buffer;
+    // 1. memory pool中首先存储ggml_object, offs字段记录ggml_object字段的结束偏移
     struct ggml_object * const obj_new = (struct ggml_object *)(mem_buffer + cur_end);
 
     if (cur_end + size_needed + GGML_OBJECT_SIZE > ctx->mem_size) {
@@ -4533,14 +4567,16 @@ static struct ggml_object * ggml_new_object(struct ggml_context * ctx, enum ggml
     }
 
     *obj_new = (struct ggml_object) {
-        .offs = cur_end + GGML_OBJECT_SIZE,
-        .size = size_needed,
+        .offs = cur_end + GGML_OBJECT_SIZE, // 偏移是相对于起始位置, 看起来是指向ggml_object末尾
+        .size = size_needed, // 可能在offs后面还需要size来存放tensor data
         .next = NULL,
         .type = type,
     };
 
     ggml_assert_aligned(mem_buffer + obj_new->offs);
 
+    // 这里表明了，各个object之间是通过链表串联起来的, 并且维护了头指针和尾指针
+    // 链表其实是放在静态数组里的
     if (obj_cur != NULL) {
         obj_cur->next = obj_new;
     } else {
@@ -4566,13 +4602,28 @@ static struct ggml_tensor * ggml_new_tensor_impl(
 
     size_t data_size = 0;
 
+    /**
+     * 1. 可能是内部分配内存给tensor data
+     * 2. 可能不是内部分配，而是从scratch_buffer中得到data
+     * 3  可能不是内部分配，也不在scratch_buffer中, 这样ctx似乎就存了ggml_object和tensor object
+     */
+
+
+    // no_alloc标记不分配内存给tensor data
+    // no_alloc = true, 表示data不是存在ctx buffer中
+    // 走该分支就是内部位tensor data分配内存(data存在ctx buffer中)
     if (data == NULL && !ctx->no_alloc) {
+        // 多少个block, 然后乘以每个block size
+        // 假设是q4_0, 可以知道，用了18个字节记录了32个fp32
+        // 假设是(512, 10), 由512可以算出有多少组，每组占用18个字节
+        // 再乘以10就是总的内存空间
         data_size += GGML_TYPE_SIZE[type]*(ne[0]/GGML_BLCK_SIZE[type]);
         for (int i = 1; i < n_dims; i++) {
             data_size *= ne[i];
         }
     }
 
+    // 是NULL
     if (ctx->scratch.data != NULL && data == NULL) {
         // allocate tensor data in the scratch buffer
         if (ctx->scratch.offs + data_size > ctx->scratch.size) {
@@ -4589,12 +4640,17 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         data_size = 0;
     }
 
+    // ggml_object用于记录对象的大小, 对象包括tensor, graph, work_buffer
+    // 对于tensor而言，不一定包括data
+    // 此时偏移obj_new.offs处可以存放tensor信息了
     struct ggml_object * const obj_new = ggml_new_object(ctx, GGML_OBJECT_TENSOR, GGML_TENSOR_SIZE + data_size);
 
     // TODO: for recoverable errors, we would need to free the data allocated from the scratch buffer here
 
+    // 此时偏移obj_new.offs处可以存放tensor信息了
     struct ggml_tensor * const result = (struct ggml_tensor *)((char *)ctx->mem_buffer + obj_new->offs);
 
+    // 实际的data可能存放在result+1的位置
     *result = (struct ggml_tensor) {
         /*.type         =*/ type,
         /*.backend      =*/ GGML_BACKEND_CPU,
@@ -4623,12 +4679,13 @@ static struct ggml_tensor * ggml_new_tensor_impl(
     }
 
     result->nb[0] = GGML_TYPE_SIZE[type];
+    // 为什么除以GGML_BLCK_SIZE[type]???
     result->nb[1] = result->nb[0]*(result->ne[0]/GGML_BLCK_SIZE[type]);
     for (int i = 2; i < GGML_MAX_DIMS; i++) {
         result->nb[i] = result->nb[i - 1]*result->ne[i - 1];
     }
 
-    ctx->n_objects++;
+    ctx->n_objects++; // 这里为什么不是在new_object里调用？
 
     return result;
 }
@@ -4718,6 +4775,7 @@ struct ggml_tensor * ggml_new_f32(struct ggml_context * ctx, float value) {
 }
 
 struct ggml_tensor * ggml_dup_tensor(struct ggml_context * ctx, const struct ggml_tensor * src) {
+    // 创建一个新的tensor, 维度和src一样
     return ggml_new_tensor_impl(ctx, src->type, src->n_dims, src->ne, NULL);
 }
 
@@ -4779,8 +4837,11 @@ struct ggml_tensor * ggml_set_i32 (struct ggml_tensor * tensor, int32_t value) {
 }
 
 struct ggml_tensor * ggml_set_f32(struct ggml_tensor * tensor, float value) {
+    // 总共有多少个vec
     const int n     = ggml_nrows(tensor);
+    // 一个vec元素个数
     const int nc    = tensor->ne[0];
+    // 一个vec占用空间
     const size_t n1 = tensor->nb[1];
 
     char * const data = tensor->data;
@@ -4803,6 +4864,7 @@ struct ggml_tensor * ggml_set_f32(struct ggml_tensor * tensor, float value) {
         case GGML_TYPE_I32:
             {
                 assert(tensor->nb[0] == sizeof(int32_t));
+                // n表示总共有多少个vec
                 for (int i = 0; i < n; i++) {
                     ggml_vec_set_i32(nc, (int32_t *)(data + i*n1), value);
                 }
@@ -5005,6 +5067,7 @@ struct ggml_tensor * ggml_format_name(struct ggml_tensor * tensor, const char * 
 struct ggml_tensor * ggml_view_tensor(
         struct ggml_context * ctx,
         const struct ggml_tensor * src) {
+    // view应当只是共享data数据的
     struct ggml_tensor * result = ggml_new_tensor_impl(ctx, src->type, src->n_dims, src->ne, src->data);
     ggml_format_name(result, "%s (view)", src->name);
 
@@ -6010,7 +6073,7 @@ struct ggml_tensor * ggml_set_2d(
         struct ggml_context * ctx,
         struct ggml_tensor *  a,
         struct ggml_tensor *  b,
-        size_t                nb1,
+        size_t                nb1, // 2d是nb1， 1d是nb0(根据类型信息便能获取，所以不需要)
         size_t                offset) {
     return ggml_set_impl(ctx, a, b, nb1, a->nb[2], a->nb[3], offset, false);
 }
@@ -6256,6 +6319,7 @@ static struct ggml_tensor * ggml_view_tensor_offset(
 
     ggml_format_name(result, "%s (view)", a->name);
 
+    // 运算符参数，记录了offset
     ggml_set_op_params(result, &offset, sizeof(offset));
 
     return result;
@@ -6273,6 +6337,7 @@ struct ggml_tensor * ggml_view_1d(
         is_node = true;
     }
 
+    // n_dims = 1, ne = n_tokens, data和a是共享的
     struct ggml_tensor * result = ggml_view_tensor_offset(ctx, a, 1, &ne0, offset);
 
     result->op   = GGML_OP_VIEW;
@@ -6298,13 +6363,14 @@ struct ggml_tensor * ggml_view_2d(
         is_node = true;
     }
 
+    // view后的维度是ne1 x ne0
     const int64_t ne[GGML_MAX_DIMS] = { ne0, ne1, 1, 1 };
 
     struct ggml_tensor * result = ggml_view_tensor_offset(ctx, a, 2, ne, offset);
 
     result->nb[1] = nb1;
     result->nb[2] = result->nb[1]*ne1;
-    result->nb[3] = result->nb[2];
+    result->nb[3] = result->nb[2]; // 应该用不到
 
     result->op   = GGML_OP_VIEW;
     result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;
@@ -6477,6 +6543,8 @@ struct ggml_tensor * ggml_get_rows(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
         struct ggml_tensor  * b) {
+    // a: emb-size, n-vocab
+    // b: any-size
     GGML_ASSERT(ggml_is_matrix(a) && ggml_is_vector(b) && b->type == GGML_TYPE_I32);
 
     bool is_node = false;
@@ -6487,6 +6555,7 @@ struct ggml_tensor * ggml_get_rows(
 
     // TODO: implement non F32 return
     //struct ggml_tensor * result = ggml_new_tensor_2d(ctx, a->type, a->ne[0], b->ne[0]);
+    // 此处应当获取行向量?
     struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a->ne[0], b->ne[0]);
 
     result->op   = GGML_OP_GET_ROWS;
@@ -7527,6 +7596,7 @@ void ggml_set_param(
     tensor->is_param = true;
 
     GGML_ASSERT(tensor->grad == NULL);
+    // tensor的梯度和tensor的维度是一样的
     tensor->grad = ggml_dup_tensor(ctx, tensor);
 }
 
@@ -15745,6 +15815,7 @@ static void ggml_visit_parents(struct ggml_cgraph * cgraph, struct ggml_tensor *
         }
     }
 
+    // 运行到这里，可以确保parents都处理结束了
     if (node->op == GGML_OP_NONE && node->grad == NULL) {
         // reached a leaf node, not part of the gradient graph (e.g. a constant)
         GGML_ASSERT(cgraph->n_leafs < GGML_MAX_NODES);
@@ -15827,11 +15898,13 @@ struct ggml_cgraph ggml_build_backward(struct ggml_context * ctx, struct ggml_cg
         }
     }
 
+    // 从后往前计算梯度
     for (int i = gf->n_nodes - 1; i >= 0; i--) {
         struct ggml_tensor * node = gf->nodes[i];
 
         // because we detached the grad nodes from the original graph, we can afford inplace operations
         if (node->grad) {
+            // 梯度计算似乎没有用到多线程
             ggml_compute_backward(ctx, node, keep);
         }
     }
@@ -15841,6 +15914,7 @@ struct ggml_cgraph ggml_build_backward(struct ggml_context * ctx, struct ggml_cg
 
         if (node->is_param) {
             GGML_PRINT_DEBUG("%s: found root node %p\n", __func__, (void *) node);
+            // 梯度计算完成后构建梯度图
             ggml_build_forward_expand(&result, node->grad);
         }
     }
@@ -16481,7 +16555,7 @@ struct ggml_cplan ggml_graph_plan(struct ggml_cgraph * cgraph, int n_threads) {
                 } break;
         }
 
-        cplan.n_tasks[i] = n_tasks;
+        cplan.n_tasks[i] = n_tasks; // 该节点需要几个线程去计算
     }
 
     if (work_size > 0) {
@@ -16524,6 +16598,7 @@ int ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
         /*.abort_callback          =*/ NULL,
         /*.abort_callback_data     =*/ NULL,
     };
+    // 此处从heap分配内存
     struct ggml_compute_state * workers = alloca(sizeof(struct ggml_compute_state)*n_threads);
 
     // create thread pool
@@ -18105,8 +18180,10 @@ enum ggml_opt_result ggml_opt_resume_g(
 
 size_t ggml_quantize_q4_0(const float * src, void * dst, int n, int k, int64_t * hist) {
     assert(k % QK4_0 == 0);
+    // 总共分为多少组
     const int nb = k / QK4_0;
 
+    // 这个循环似乎只进行一次
     for (int b = 0; b < n; b += k) {
         block_q4_0 * restrict y = (block_q4_0 *) dst + b/QK4_0;
 
@@ -18114,9 +18191,12 @@ size_t ggml_quantize_q4_0(const float * src, void * dst, int n, int k, int64_t *
 
         for (int i = 0; i < nb; i++) {
             for (int j = 0; j < QK4_0; j += 2) {
+                // 低4位是j位置的量化值
                 const uint8_t vi0 = y[i].qs[j/2] & 0x0F;
+                // 高4位是j+16位置的量化值
                 const uint8_t vi1 = y[i].qs[j/2] >> 4;
 
+                // 统计出现频率
                 hist[vi0]++;
                 hist[vi1]++;
             }
@@ -18231,11 +18311,19 @@ size_t ggml_quantize_q8_0(const float * src, void * dst, int n, int k, int64_t *
 }
 
 size_t ggml_quantize_chunk(enum ggml_type type, const float * src, void * dst, int start, int n, int64_t * hist) {
+    // n是元素个数
+    // 量化都是先转化为float类型再去做的
+    // Q4_0是32个元素一组去做量化, 32个元素占用32 * 4个字节，
+    // 量化后用一个2+16个字节的block_q4_0的结构体存储结果，
+    // 该结构体前2个字节，存储delta
+    // 该结构体后16个字节，存储这32位元素的4bit量化结果，
     size_t result = 0;
     switch (type) {
         case GGML_TYPE_Q4_0:
             {
+                // QK4_0 = 32
                 GGML_ASSERT(start % QK4_0 == 0);
+                // dst的空间是足够的
                 block_q4_0 * block = (block_q4_0*)dst + start / QK4_0;
                 result = ggml_quantize_q4_0(src + start, block, n, n, hist);
             } break;

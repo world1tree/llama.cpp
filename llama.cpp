@@ -218,6 +218,7 @@ struct llama_hparams {
     size_t kv_size() const {
         size_t result = 2ull;
         result *= (size_t) n_embd_gqa();
+        // 为什么要乘以n_ctx, 因为n_ctx是上下文长度
         result *= (size_t) n_ctx;
         result *= (size_t) n_layer;
         result *= sizeof(ggml_fp16_t);
@@ -250,6 +251,7 @@ struct llama_kv_cache {
 
     struct ggml_context * ctx = NULL;
 
+    // 这段空间用于存储kv_cache, 然后来初始化ctx
     llama_ctx_buffer buf;
 
     int n; // number of tokens currently in the cache
@@ -295,10 +297,10 @@ struct llama_model {
     // context
     struct ggml_context * ctx = NULL;
 
-    // the model memory buffer
+    // the model memory buffer, 这里的内存之后会被移到ctx中, zero_initialzation
     llama_ctx_buffer buf;
 
-    // model memory mapped file
+    // model memory mapped file, 内存映射model file
     std::unique_ptr<llama_mmap> mapping;
 
     // objects representing data potentially being locked in memory
@@ -473,10 +475,14 @@ static size_t llama_calc_tensor_size(const std::vector<uint32_t> & ne, enum ggml
 }
 
 struct llama_load_tensor {
+        // 记录tensor name
     std::string name;
     enum ggml_type type = GGML_TYPE_F32;
+    // 记录tensor的维度
     std::vector<uint32_t> ne;
+    // 记录tensor data的起始指针
     size_t file_off;
+    // 记录tensor data的大小
     size_t size;
     struct ggml_tensor * ggml_tensor = NULL;
     uint8_t * data;
@@ -504,6 +510,7 @@ struct llama_file_loader {
 
     llama_file_loader(const char * fname, llama_load_tensors_map & tensors_map)
         : file(fname, "rb") {
+        // 生成llama_file_loader对象的时候，大数据都读入内存了
         fprintf(stderr, "llama.cpp: loading model from %s\n", fname);
         read_magic();
         read_hparams();
@@ -517,7 +524,7 @@ struct llama_file_loader {
             file_version = LLAMA_FILE_VERSION_GGML;
             return;
         }
-
+        // 为什么这里没有大小端的问题, struct.pack已经帮忙处理好了
         uint32_t version = file.read_u32();
 
         switch (magic) {
@@ -554,31 +561,41 @@ struct llama_file_loader {
         vocab.id_to_token.resize(hparams.n_vocab);
 
         for (uint32_t i = 0; i < hparams.n_vocab; i++) {
+            // token长度
             uint32_t len = file.read_u32();
+            // token
             std::string word = file.read_string(len);
 
             float score = 0.0f;
+            // score
             file.read_raw(&score, sizeof(score));
 
             vocab.token_to_id[word] = i;
 
             auto & tok_score = vocab.id_to_token[i];
-            tok_score.tok = std::move(word);
+            tok_score.tok = std::move(word); // 避免copy
             tok_score.score = score;
         }
     }
     void read_tensor_metadata(llama_load_tensors_map & tensors_map) {
         while (file.tell() < file.size) {
             llama_load_tensor tensor;
+            // tensor的维度
             uint32_t n_dims = file.read_u32();
+            // tensor name的长度
             uint32_t name_len = file.read_u32();
+            // tensor的类型
             tensor.type = (enum ggml_type) file.read_u32();
             tensor.ne.resize(n_dims);
+            // tensor每个维度的大小，.data方法很重要，可以提供兼容, 这里是一次性读了一块
             file.read_raw(tensor.ne.data(), sizeof(tensor.ne[0]) * n_dims);
+            // tensor的name
             std::string name = file.read_string(name_len);
+            // tensor只能是一维或者二维
             if (n_dims < 1 || n_dims > 2) {
                 throw std::runtime_error(format("llama.cpp: tensor '%s' should not be %u-dimensional", name.c_str(), n_dims));
             }
+            // 校验类型
             switch (tensor.type) {
                 case GGML_TYPE_F32:
                 case GGML_TYPE_F16:
@@ -598,14 +615,16 @@ struct llama_file_loader {
                 }
             }
 
-            // skip to the next multiple of 32 bytes
+            // skip to the next multiple of 32 bytes, 为什么最开始要做对齐? TODO
             if (file_version >= LLAMA_FILE_VERSION_GGJT_V1) {
                 file.seek(-static_cast<ptrdiff_t>(file.tell()) & 31, SEEK_CUR);
             }
 
+            // 记录file_off的目的是什么? 应该是为了从file_off处加载tensor data
             tensor.file_off = file.tell();
             tensor.name = name;
             tensor.size = llama_calc_tensor_size(tensor.ne, tensor.type);
+            // seek到下一个tensor metadata位置
             file.seek(tensor.size, SEEK_CUR);
 
             tensors_map.tensors.push_back(tensor);
@@ -667,13 +686,20 @@ struct llama_file_saver {
                 break;
             default: LLAMA_ASSERT(false);
         }
+        // 几维
         file.write_u32((uint32_t) tensor.ne.size());
+        // name长度
         file.write_u32((uint32_t) tensor.name.size());
+        // 类型
         file.write_u32(new_type);
+        // 每维大小
         file.write_raw(tensor.ne.data(), sizeof(tensor.ne[0]) * tensor.ne.size());
+        // name
         file.write_raw(tensor.name.data(), tensor.name.size());
+        // 32字节对齐
         file.seek(-static_cast<ptrdiff_t>(file.tell()) & 31, SEEK_CUR);
         LLAMA_ASSERT(new_size == llama_calc_tensor_size(tensor.ne, new_type));
+        // 量化数据
         file.write_raw(new_data, new_size);
     }
 };
@@ -684,6 +710,7 @@ struct llama_model_loader {
     bool use_mmap;
     size_t num_ggml_tensors_created = 0;
     struct ggml_context * ggml_ctx = NULL;
+    // 如果做了mmap, 那么所有的tensor data数据(模型文件)都加载到了llama_mmap这里了
     std::unique_ptr<llama_mmap> mapping;
 
     llama_model_loader(const std::string & fname_base, bool use_mmap) {
@@ -691,13 +718,17 @@ struct llama_model_loader {
         if (!llama_mmap::SUPPORTED) {
             use_mmap = false;
         }
+        // baby_llama是false, 在main中默认是true
+        // mmap应该是内存映射
         this->use_mmap = use_mmap;
     }
 
     void calc_sizes(size_t * ctx_size_p, size_t * mmapped_size_p) const {
         *ctx_size_p = *mmapped_size_p = 0;
         for (const llama_load_tensor & lt : tensors_map.tensors) {
+            // ggml_tensor结构体的大小 + ggml_object的大小
             *ctx_size_p += sizeof(struct ggml_tensor) + GGML_OBJECT_SIZE;
+            // lt.size是tensor data的大小, 16是什么?
             *(use_mmap ? mmapped_size_p : ctx_size_p) += lt.size + 16;
         }
     }
@@ -717,6 +748,7 @@ struct llama_model_loader {
     }
 
     struct ggml_tensor * get_tensor_for(llama_load_tensor & lt, ggml_backend backend) {
+        // 该函数只是创建了tensor, 不包含实际数据的内存
         struct ggml_tensor * tensor;
         if (backend != GGML_BACKEND_CPU) {
             ggml_set_no_alloc(ggml_ctx, true);
@@ -781,6 +813,7 @@ struct llama_model_loader {
 
             switch(lt.ggml_tensor->backend) {
                 case GGML_BACKEND_CPU:
+                    // 这里再把数据放到ggml_tensor里
                     lt.ggml_tensor->data = lt.data;
                     if (use_mmap && lmlock) {
                         lock_size += lt.size;
@@ -813,10 +846,12 @@ struct llama_model_loader {
 
     void load_data_for(llama_load_tensor & lt) {
         if (use_mmap) {
+            // 直接指向mmaping中对应的内存位置即可, 这里是把数据放在了lt.data里，不是ggml_tensor里
             lt.data = (uint8_t *) mapping->addr + lt.file_off;
         } else {
             llama_file & file = file_loader->file;
-            file.seek(lt.file_off, SEEK_SET);
+            // file_off的位置就是tensor数据的起始位置
+            file.seek(lt.file_off, SEEK_SET); // SEEK_SET相对于文件开头的偏移量
             file.read_raw(lt.data, lt.size);
         }
 
@@ -868,6 +903,7 @@ static bool kv_cache_init(
         return false;
     }
 
+    // 一个token的所有上下文占用空间
     cache.k = ggml_new_tensor_1d(cache.ctx, wtype, n_elements);
     cache.v = ggml_new_tensor_1d(cache.ctx, wtype, n_elements);
     ggml_set_name(cache.k, "cache_k");
@@ -1042,9 +1078,12 @@ static void llama_model_load_internal(
 
     model.t_start_us = ggml_time_us();
 
+    // 为什么要用指针?
     std::unique_ptr<llama_model_loader> ml(new llama_model_loader(fname, use_mmap));
 
+    // move一个结构体？
     vocab = std::move(ml->file_loader->vocab);
+    // 为什么不move?
     model.hparams = ml->file_loader->hparams;
     model.n_gpu_layers = n_gpu_layers;
     llama_file_version file_version = ml->file_loader->file_version;
@@ -1135,16 +1174,24 @@ static void llama_model_load_internal(
     size_t ctx_size;
     size_t mmapped_size;
     ml->calc_sizes(&ctx_size, &mmapped_size);
+    // ctx所需要的空间和mmap所需要的空间
     fprintf(stderr, "%s: ggml ctx size = %7.2f MB\n", __func__, ctx_size/1024.0/1024.0);
 
     // create the ggml context
     {
+        // new了一段空间
         model.buf.resize(ctx_size);
+        // 内存锁
         if (use_mlock) {
             model.mlock_buf.init   (model.buf.addr);
             model.mlock_buf.grow_to(model.buf.size);
         }
 
+        // 1. 由于使用了mmap, ctx会存储ggml_tensor结构体 + ggml_object
+        // 不会存储tensor data
+        // 涉及到内存分配相关的操作，会出现两种情况
+        // 1. 在结构体外分配内存，通过参数传入结构体对应内存字段
+        // 2. 结构体内部分配内存
         struct ggml_init_params params = {
             /*.mem_size   =*/ model.buf.size,
             /*.mem_buffer =*/ model.buf.addr,
@@ -1183,7 +1230,7 @@ static void llama_model_load_internal(
         const uint32_t n_layer    = hparams.n_layer;
         const uint32_t n_vocab    = hparams.n_vocab;
 
-        ml->ggml_ctx = ctx;
+        ml->ggml_ctx = ctx; // 使用这段内存来存储object, tensor metadata
 
         model.tok_embeddings = ml->get_tensor("tok_embeddings.weight", {n_embd, n_vocab}, GGML_BACKEND_CPU);
 
@@ -1253,6 +1300,7 @@ static void llama_model_load_internal(
 
     // print memory requirements
     {
+        // memory_type默认是fp16
         const size_t scale = memory_type == GGML_TYPE_F32 ? 2 : 1;
 
         // this is the total memory required to run the inference
@@ -1268,6 +1316,7 @@ static void llama_model_load_internal(
 #endif
 
         // this is the memory required by one llama_state
+        // 当上下文被占满时, 最多会占用这么多空间, 理论上这段空间是固定的
         const size_t mem_required_state =
             scale*hparams.kv_size();
 
@@ -1346,7 +1395,7 @@ static void llama_model_load_internal(
         ggml_cuda_set_tensor_split(tensor_split);
     }
 #endif
-
+    // 把tensor data加载到正确位置
     ml->load_all_data(progress_callback, progress_callback_user_data, use_mlock ? &model.mlock_mmap : NULL);
 
     if (progress_callback) {
@@ -1571,16 +1620,20 @@ static struct ggml_cgraph * llama_build_graph(
                 offload_func_v(Vcur);
                 ggml_set_name(Vcur, "Vcur");
 
+                // 应当是从kv_self.k/v的缓冲区中拿出对应位置的数据用于存放当前计算出的k和v
                 struct ggml_tensor * k = ggml_view_1d(ctx0, kv_self.k, N*n_embd_gqa, (ggml_element_size(kv_self.k)*n_embd_gqa)*(il*n_ctx + n_past));
                 offload_func_kq(k);
                 ggml_set_name(k, "k");
 
+                // n_past超过上下文后如何处理?
                 struct ggml_tensor * v = ggml_view_2d(ctx0, kv_self.v, N, n_embd_gqa,
-                        (   n_ctx)*ggml_element_size(kv_self.v),
+                        (   n_ctx)*ggml_element_size(kv_self.v), // 1个token的上下文占用
+                        // 应该是从此处存储v
                         (il*n_ctx)*ggml_element_size(kv_self.v)*n_embd_gqa + n_past*ggml_element_size(kv_self.v));
                 offload_func_v(v);
                 ggml_set_name(v, "v");
 
+                // 过了线性层之后的k和v都追加到kv_self.k/v中
                 // important: storing RoPE-ed version of K in the KV cache!
                 ggml_build_forward_expand(gf, ggml_cpy(ctx0, Kcur, k));
                 ggml_build_forward_expand(gf, ggml_cpy(ctx0, Vcur, v));
@@ -1596,6 +1649,7 @@ static struct ggml_cgraph * llama_build_graph(
             struct ggml_tensor * K =
                 ggml_permute(ctx0,
                         ggml_reshape_3d(ctx0,
+                            // 取出这一层的k/v cache
                             ggml_view_1d(ctx0, kv_self.k, (n_past + N)*n_embd_gqa, il*n_ctx*ggml_element_size(kv_self.k)*n_embd_gqa),
                             n_embd_head, n_head_kv, n_past + N),
                         0, 2, 1, 3);
@@ -3004,6 +3058,8 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     for (llama_load_tensor & tensor : model_loader->tensors_map.tensors) {
         llama_buffer read_data;
         read_data.resize(tensor.size);
+        // read_data[buffer]的指针给了tensor.data, 如何防止内存回收的
+        // 没有防止，在llama_buffer析构前，数据已经被写入文件了
         tensor.data = read_data.addr;
         model_loader->load_data_for(tensor);
 
@@ -3017,7 +3073,9 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
 
         // quantize only 2D tensors
         quantize &= (tensor.ne.size() == 2);
+        // 是否quantize output.weight
         quantize &= params->quantize_output_tensor || tensor.name != "output.weight";
+        // 当前tensor没有被量化过
         quantize &= quantized_type != tensor.type;
 
         enum ggml_type new_type;
@@ -3037,6 +3095,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                 int nx = tensor.ne.at(0);
                 int ny = tensor.ne.at(1);
                 if (nx % QK_K == 0 && ny % QK_K == 0) {
+                    // Q6_k是什么?
                     new_type = GGML_TYPE_Q6_K;
                 }
             } else if (tensor.name.find("attention.wv.weight") != std::string::npos) {
@@ -3086,10 +3145,12 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             llama_buffer f32_conv_buf;
 
             if (tensor.type == GGML_TYPE_F32) {
+                // 获取ndarray.tofile存储的行主序的tensor数据
                 f32_data = (float *) tensor.data;
             } else if (ggml_is_quantized(tensor.type) && !params->allow_requantize) {
                 throw std::runtime_error(format("requantizing from type %s is disabled", ggml_type_name(tensor.type)));
             } else {
+                // 似乎是把fp16转换为fp32
                 llama_convert_tensor_internal(tensor, f32_conv_buf, nelements, nthread);
                 f32_data = (float *) f32_conv_buf.addr;
             }
@@ -3097,8 +3158,11 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             printf("quantizing to %s .. ", ggml_type_name(new_type));
             fflush(stdout);
 
+            // work的类型是uint8_t, 相当于是字节
             work.resize(nelements * 4); // upper bound on size
+            // 量化后的数据不会超过原始数据大小，即便有额外的数据，如delta之类
             new_data = work.addr;
+            // 1<<4 = 16个64位整数, 初始值为0, 4位量化，数值范围为0-15
             std::vector<int64_t> hist_cur(1 << 4, 0);
 
             int chunk_size = 32 * 512;
@@ -3151,6 +3215,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                 tot_count += hist_cur[i];
             }
 
+            // 统计每个数值出现频次
             if (tot_count > 0) {
                 for (size_t i = 0; i < hist_cur.size(); i++) {
                     printf("%5.3f ", hist_cur[i] / float(nelements));
@@ -3162,7 +3227,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         total_size_new += new_size;
         file_saver.write_tensor(tensor, new_type, new_data, new_size);
     }
-
+    // 量化结束
     printf("%s: model size  = %8.2f MB\n", __func__, total_size_org/1024.0/1024.0);
     printf("%s: quant size  = %8.2f MB\n", __func__, total_size_new/1024.0/1024.0);
 
@@ -3221,6 +3286,7 @@ struct llama_context * llama_new_context_with_model(
         return nullptr;
     }
 
+    // model被放入了llama_context中
     llama_context * ctx = new llama_context(*model);
 
     if (params.seed == LLAMA_DEFAULT_SEED) {
@@ -3279,13 +3345,16 @@ struct llama_context * llama_new_context_with_model(
         {
             static const size_t tensor_alignment = 32;
             // the compute buffer is used to store the tensor and graph structs, while the allocator buffer is used for the tensor data
+            // object/tensor/graph的结构体占用内存, tensor data用了mmap已经不在此处了
             ctx->buf_compute.resize(ggml_tensor_overhead()*GGML_MAX_NODES + ggml_graph_overhead());
 
             // create measure allocator
             ctx->alloc = ggml_allocr_new_measure(tensor_alignment);
 
             // build worst-case graph
+            // 假设是1
             int n_tokens = std::min((int)hparams.n_ctx, params.n_batch);
+            // n_past用来记录解码时当前的上下文长度
             int n_past = hparams.n_ctx - n_tokens;
             llama_token token = llama_token_bos(); // not actually used by llama_build_graph, but required to choose between token and embedding inputs graph
             ggml_cgraph * gf = llama_build_graph(*ctx, &token, NULL, n_tokens, n_past);

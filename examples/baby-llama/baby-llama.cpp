@@ -477,6 +477,7 @@ bool init_kv_cache(struct llama_kv_cache* cache, struct llama_model * model, int
     // params.no_alloc   = false;
     if (!cache->ctx) {
         struct ggml_init_params params;
+        // 这里k,v用的是fp32
         params.mem_size   = 2u*n_elements*ggml_type_size(GGML_TYPE_F32) + 2u*1024*1024;
         params.mem_buffer = NULL;
         params.no_alloc   = false;
@@ -489,6 +490,7 @@ bool init_kv_cache(struct llama_kv_cache* cache, struct llama_model * model, int
         }
     }
 
+    // k和v的空间预先就分配好了，后续不会再增加, 是1d的
     cache->k = ggml_new_tensor_1d(cache->ctx, GGML_TYPE_F32, n_elements);
     cache->v = ggml_new_tensor_1d(cache->ctx, GGML_TYPE_F32, n_elements);
 
@@ -804,7 +806,9 @@ struct ggml_tensor * forward_batch(
     const int n_rot   = hparams.n_rot;
     const int n_ff    = get_n_ff(&hparams);
 
+    // n_tokens x n_batch
     struct ggml_tensor * tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, N*n_batch);
+    // tokens_input: n_tokens, n_batch, 相当于2d->1d
     memcpy(tokens->data, tokens_input->data, ggml_element_size(tokens)*N*n_batch);
 
     struct ggml_tensor * kc = kv_self.k;
@@ -822,11 +826,12 @@ struct ggml_tensor * forward_batch(
 
         // norm
         {
-            // cur shape [n_embd,N*n_batch,1,1]
+            // cur shape [n_embd,N*n_batch,1,1], 经过normalization
             cur = ggml_rms_norm(ctx0, inpL, rms_norm_eps);
             assert_shape_2d(cur, n_embd, N*n_batch);
 
             // cur = attention_norm*cur
+            // attention_norm的维度是emb-size
             cur = ggml_mul(ctx0,
                         ggml_repeat(ctx0, model->layers[il].attention_norm, cur),
                         cur);
@@ -877,15 +882,18 @@ struct ggml_tensor * forward_batch(
                     ggml_build_forward_expand(gf, ggml_cpy(ctx0, Vcur, v));
                 } //*/
 
+                // kc是1d的，后面是2d的, 估计是把2d的空间copy到1d的tensor中
                 kc = ggml_set_2d(ctx0, kc,
                         ggml_reshape_2d(ctx0, Kcur, n_embd*N, n_batch),
-                        ggml_element_size(kc)*n_embd*n_ctx,
+                        ggml_element_size(kc)*n_embd*n_ctx, // each layer 1个单词的上文空间大小
+                        // 第几层，第几句，第几个单词的offset
                         (ggml_element_size(kc)*n_embd)*(il*n_batch*n_ctx + n_past));
                 vc = ggml_set_2d(ctx0, vc,
                         ggml_reshape_2d(ctx0, Vcur, N*n_embd, n_batch),
                         ggml_element_size(vc)*n_ctx*n_embd,
                         ggml_element_size(vc)*(n_past + il*n_embd*n_batch*n_ctx));
 
+                // kc和kv的维度从来没有改变过
                 assert_shape_1d(kc, n_embd * n_ctx * n_batch * n_layer);
                 assert_shape_1d(vc, n_embd * n_ctx * n_batch * n_layer);
             }
@@ -1435,17 +1443,24 @@ void get_example_targets(int example_id, struct ggml_tensor * tokens_input, stru
     int n_vocab = targets->ne[0];
     float randomness = 0.0f;
     // ggml_set_zero(targets);
+    // n_vocab, n_tokens: 赋值为-1
     ggml_set_f32(targets, -1.0f);
+    // n_tokens: tokens_input[0] = 0
     ggml_set_i32_1d(tokens_input, 0, 0);
     for (int i=1; i<n_tokens+1; ++i) {
+        // 某种随机数
         float x = example_id + i * 3.14159f * 2.0f * 1.0f * 0.5f / n_tokens;
         float y = sinf(x);//*cosf(x*1.1f+1.0f);
         float z = (y+1.0f)*0.5f; // scale to [0..1]
         z += (frand()-0.5f)*(randomness/n_vocab);
         z = (z < 0.0f) ? 0.0f : (z > 1.0f) ? 1.0f : z; // clamp to [0..1]
+
+        // token范围是1~n_vocab-1
         int token = std::max(1,std::min(1+(int)(z*(float)(n_vocab-1)), n_vocab-1));
+        // targets某些位置赋值为1
         ggml_set_f32_1d(targets, (i-1)*n_vocab + token, +1.0f);
         if (i<n_tokens) {
+            // tokens_input其余位置，可能是1~n_vocab-`的任意值
             ggml_set_i32_1d(tokens_input, i, token);
         }
     }
@@ -1460,10 +1475,12 @@ void get_example_targets_batch(struct ggml_context * ctx, int example_id, struct
     GGML_ASSERT(n_batch  == targets->ne[2]);
 
     for (int k=0; k<n_batch; ++k) {
+        // 获取第k个example, n_tokens
         struct ggml_tensor * tokens_input_k = ggml_view_1d(ctx,
                                                 tokens_input,
                                                 tokens_input->ne[0],
                                                 k*tokens_input->nb[1]);
+        // n_vocab, n_tokens
         struct ggml_tensor * targets_k    = ggml_view_2d(ctx,
                                                 targets,
                                                 targets->ne[0],
@@ -1512,6 +1529,7 @@ int main(int argc, char ** argv) {
     }
 
     struct ggml_init_params lcparams;
+    // 1GB内存空间
     lcparams.mem_size   = 1024ll*1024ll*1024ll;
     lcparams.mem_buffer = NULL;
     lcparams.no_alloc   = false;
@@ -1579,15 +1597,18 @@ int main(int argc, char ** argv) {
     init_kv_cache(&kv_self, &model, n_batch);
     //init_kv_cache_lora(&kv_self, &model_lora);
 
+    // 共用内存空间
     size_t    compute_size = 1024ll*1024ll*1024ll;
     uint8_t * compute_addr = new uint8_t[compute_size];
 
     int n_examples = 256;
+    // tokens为什么会来自n_ctx? 因为n_ctx表示上下文的长度
     int n_tokens = model.hparams.n_ctx;
     int n_vocab  = model.hparams.n_vocab;
 
     std::vector<uint8_t> work_buffer;
 
+    // 训练过程
     for (int ex=0; ex<n_examples; ++ex) {
         struct ggml_init_params params = {
             /*.mem_size   =*/ compute_size,
@@ -1595,11 +1616,16 @@ int main(int argc, char ** argv) {
             /*.no_alloc   =*/ false,
         };
 
+        // 新的ctx, 只不过是共用了compute_addr
         struct ggml_context * ctx0 = ggml_init(params);
 
+        // n_batch x n_tokens
         struct ggml_tensor * after_opt_best_samples  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_tokens, n_batch);
+        // n_batch x n_tokens x n_vocab
         struct ggml_tensor * after_opt_probs         = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_vocab, n_tokens, n_batch);
+        // n_batch x n_tokens
         struct ggml_tensor * tokens_input            = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_tokens, n_batch);
+        // n_batch x n_tokens x n_vocab
         struct ggml_tensor * targets                 = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_vocab, n_tokens, n_batch);
 
         int n_past = 0;
@@ -1607,12 +1633,14 @@ int main(int argc, char ** argv) {
         ggml_cgraph gf = {};
 
         get_example_targets_batch(ctx0, 64*ex+0,  tokens_input, targets);
-
+        // n_vocab, N, n_batch, forward这个过程，实际没有发生计算, 只是分配了每一个结果的内存
         struct ggml_tensor * logits = forward_batch(&model, &kv_self, ctx0, &gf, tokens_input, n_tokens, n_past, n_batch);
         // struct ggml_tensor * e = cross_entropy_loss(ctx0, targets, logits);
         struct ggml_tensor * e = square_error_loss(ctx0, targets, logits);
 
+        // 再次构建计算图, visited_hash_table逻辑实现了就没有问题了
         ggml_build_forward_expand(&gf, e);
+        // 执行forward计算
         ggml_graph_compute_helper(work_buffer, &gf, /*n_threads*/ 1);
 
         float error_before_opt = ggml_get_f32_1d(e, 0);
@@ -1627,7 +1655,7 @@ int main(int argc, char ** argv) {
         opt_params_lbfgs.lbfgs.n_iter = 16;
         // ggml_opt(ctx0, opt_params_adam, e);
         ggml_opt(ctx0, opt_params_lbfgs, e);
-        //
+        // 优化后，再次进行forward计算loss
         ggml_build_forward_expand(&gf, e);
         ggml_graph_compute_helper(work_buffer, &gf, /*n_threads*/ 1);
 

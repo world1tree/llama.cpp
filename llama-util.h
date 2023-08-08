@@ -106,6 +106,7 @@ struct llama_file {
             return;
         }
         errno = 0;
+        // 第一个参数是缓冲区指针，第二个参数是要读取的数据类型大小，第三个参数是要读取的数据个数，第四个参数是文件fp
         std::size_t ret = std::fread(ptr, len, 1, fp);
         if (ferror(fp)) {
             throw std::runtime_error(format("read error: %s", strerror(errno)));
@@ -444,7 +445,7 @@ struct llama_buffer {
         addr = NULL;
     }
 
-    // disable copy and move
+    // disable copy and move, 有这些函数会拖慢性能吗
     llama_buffer(const llama_buffer&) = delete;
     llama_buffer(llama_buffer&&) = delete;
     llama_buffer& operator=(const llama_buffer&) = delete;

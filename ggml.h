@@ -129,6 +129,9 @@
 //
 // The data of the tensor is accessed via the "data" pointer. For example:
 //
+// 比如 3x2, float类型的数组
+// => ne = {2, 3}, nb = {4, 8}
+//
 //   {
 //       struct ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, 3);
 //
@@ -405,11 +408,12 @@ extern "C" {
 
     // ggml object
     struct ggml_object {
-        size_t offs;
-        size_t size;
+        size_t offs; // 记录该object末尾的偏移(该object后面数据的偏移)
+        size_t size; // 记录该object后面数据的size
 
         struct ggml_object * next;
 
+        // tensor or graph or buffer
         enum ggml_object_type type;
 
         char padding[4];
@@ -424,6 +428,9 @@ extern "C" {
 
         int     n_dims;
         int64_t ne[GGML_MAX_DIMS]; // number of elements
+        // 比如 3x2, int类型的数组
+        // => ne = {2, 3}, nb = {4, 8}
+        // [2,1] = 2*nb[1] + 1*nb[0]
         size_t  nb[GGML_MAX_DIMS]; // stride in bytes:
                                    // nb[0] = sizeof(type)
                                    // nb[1] = nb[0]   * ne[0] + padding
@@ -437,7 +444,9 @@ extern "C" {
 
         bool is_param;
 
+        // 梯度
         struct ggml_tensor * grad;
+        // 来源，构建计算图
         struct ggml_tensor * src[GGML_MAX_SRC];
 
         // performance
@@ -445,12 +454,15 @@ extern "C" {
         int64_t perf_cycles;
         int64_t perf_time_us;
 
+        // 存储tensor的实际数值
         void * data;
 
+        // tensor的name, 不超过48个字符
         char name[GGML_MAX_NAME];
 
         void * extra; // extra things e.g. for ggml-cuda.cu
 
+        // 不知道为什么加padding, 也许是为了使得该结构体最起码是4字节对齐的
         char padding[4];
     };
 
@@ -507,7 +519,7 @@ extern "C" {
         // memory pool
         size_t mem_size;   // bytes
         void * mem_buffer; // if NULL, memory will be allocated internally
-        bool   no_alloc;   // don't allocate memory for the tensor data
+        bool   no_alloc;   // don't allocate memory for the tensor data, 因为有了mmap内存映射
     };
 
 

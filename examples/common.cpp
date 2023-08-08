@@ -662,6 +662,7 @@ struct llama_context_params llama_context_params_from_gpt_params(const gpt_param
 std::tuple<struct llama_model *, struct llama_context *> llama_init_from_gpt_params(const gpt_params & params) {
     auto lparams = llama_context_params_from_gpt_params(params);
 
+    // 模型的所有量化权重已经正确放入了tensor的data位置
     llama_model * model  = llama_load_model_from_file(params.model.c_str(), lparams);
     if (model == NULL) {
         fprintf(stderr, "%s: error: failed to load model '%s'\n", __func__, params.model.c_str());
